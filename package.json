@@ -1,0 +1,28 @@
+{
+  "dependencies": {
+    "cors": "^2.8.6",
+    "dotenv": "^18.0.3",
+    "express": "^5.2.1",
+    "openai": "^7.23.0",
+    "replicate": "^1.4.0"
+  },
+  "name": "renderagent-be",
+  "version": "1.0.0",
+  "description": "��#\u0000 \u0000r\u0000e\u0000n\u0000d\u0000e\u0000r\u0000A\u0000g\u0000e\u0000n\u0000t\u0000-\u0000B\u0000e\u0000\r\u0000 \u0000",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/AntonioCh83/renderAgent-Be.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "module",
+  "bugs": {
+    "url": "https://github.com/AntonioCh83/renderAgent-Be/issues"
+  },
+  "homepage": "https://github.com/AntonioCh83/renderAgent-Be#readme"
+}
