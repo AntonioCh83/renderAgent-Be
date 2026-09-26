@@ -1,131 +1,133 @@
+import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
-import OpenAI from 'openai';
-import Replicate from 'replicate';
-import 'dotenv/config';
+import { rateLimit } from 'express-rate-limit';
+import { BRAND } from './src/config.js';
+import { nextTurn, finalizeDesign, refineDesign } from './src/designAgent.js';
+import { getProductsByIds } from './src/catalog.js';
+import { createDesign, getDesign, saveDesign, RENDERS_DIR } from './src/store.js';
+import { generateRenders } from './src/renderer.js';
+import { sanitizeMessages, sanitizeProfile, sanitizeInstruction } from './src/validation.js';
+import { PublicError } from './src/errors.js';
+
+const PORT = Number(process.env.PORT) || 3000;
+const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || 'http://localhost:5173,http://127.0.0.1:5173')
+  .split(',')
+  .map(o => o.trim());
+const RENDER_VARIANTS = Math.min(4, Math.max(1, Number(process.env.RENDER_VARIANTS) || 2));
+const MAX_RENDERS_PER_DESIGN = Number(process.env.MAX_RENDERS_PER_DESIGN) || 12;
 
 const app = express();
+if (process.env.TRUST_PROXY) app.set('trust proxy', 1);
 
-app.use(cors({
-  origin: '*' // Per i test locali accetta connessioni da qualsiasi porta locale
-}));
-app.use(express.json());
+app.use(cors({ origin: ALLOWED_ORIGINS }));
+app.use(express.json({ limit: '100kb' }));
+app.use('/renders', express.static(RENDERS_DIR, { maxAge: '7d' }));
 
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-const replicate = new Replicate({ auth: process.env.REPLICATE_API_TOKEN });
+// Protegge i crediti OpenAI/Replicate da abusi
+const limiter = (limit, message) => rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit,
+  standardHeaders: 'draft-8',
+  legacyHeaders: false,
+  message: { error: message }
+});
+const chatLimiter = limiter(80, 'Troppi messaggi in poco tempo, riprova tra qualche minuto.');
+const renderLimiter = limiter(10, 'Hai raggiunto il limite di render, riprova tra qualche minuto.');
+const refineLimiter = limiter(20, 'Troppe modifiche in poco tempo, riprova tra qualche minuto.');
 
-// IL TUO CATALOGO PRODOTTI (Puoi aggiungere o modificare questi elementi)
-const CATALOGO_PRODOTTI = [
-  {
-    id: "PAV-01",
-    categoria: "pavimento",
-    nome: "Gres Porcellanato Effetto Rovere Naturale",
-    descrizione: "Piastrelle in gres porcellanato chiaro effetto legno nordico.",
-    url: "https://tuosito.com"
-  },
-  {
-    id: "PAV-02",
-    categoria: "pavimento",
-    nome: "Marmo Carrara Lucido",
-    descrizione: "Rivestimento di lusso in finto marmo bianco con venature grigie.",
-    url: "https://tuosito.com"
-  },
-  {
-    id: "SAN-01",
-    categoria: "sanitari",
-    nome: "Set Sanitari Sospesi Nero Opaco Matte",
-    descrizione: "Water e bidet dal design moderno e minimale di colore nero opaco.",
-    url: "https://tuosito.com"
-  },
-  {
-    id: "MOB-01",
-    categoria: "mobili",
-    nome: "Mobile Bagno Sospeso in Legno di Noce",
-    descrizione: "Mobile con cassettone in legno scuro e lavabo d'appoggio in ceramica bianca.",
-    url: "https://tuosito.com"
-  }
-];
+function toClientDesign(design) {
+  const reasons = new Map(design.final.selected_products.map(p => [p.id, p.reason]));
+  return {
+    id: design.id,
+    createdAt: design.createdAt,
+    profile: design.profile,
+    final: design.final,
+    products: getProductsByIds([...reasons.keys()]).map(p => ({ ...p, reason: reasons.get(p.id) })),
+    renders: design.renders
+  };
+}
 
-app.post('/api/chat', async (req, res) => {
-  const { messages } = req.body;
+async function loadDesignOr404(req, res) {
+  const design = await getDesign(req.params.id);
+  if (!design) res.status(404).json({ error: 'Progetto non trovato.' });
+  return design;
+}
 
-  const systemInstruction = `
-  Sei un interior designer e assistente alle vendite virtuale. 
-  Il tuo obiettivo è interagire con il cliente per progettare la sua stanza e consigliargli i prodotti del NOSTRO CATALOGO.
-  
-  Ecco il nostro CATALOGO PRODOTTI ufficiale:
-  ${JSON.stringify(CATALOGO_PRODOTTI, null, 2)}
-
-  LINEE GUIDA:
-  1. Fai una domanda breve alla volta per capire: Tipo di stanza, Stile, Pavimento desiderato, Mobili/Sanitari.
-  2. Cerca di orientare sottilmente le scelte dell'utente verso i prodotti presenti nel catalogo sopra riportato.
-  3. Quando hai raccolto tutte le preferenze, devi concludere la chat restituendo ESATTAMENTE e SOLO un oggetto JSON (senza markdown o testo extra). 
-  
-  Il JSON deve avere questa struttura precisa:
-  {
-    "status": "completed",
-    "room_type": "tipo di stanza",
-    "style": "stile generale",
-    "flooring": "descrizione dettagliata del pavimento scelto",
-    "furniture": "descrizione dei mobili scelti",
-    "selected_products": ["ID-PRODOTTO-1", "ID-PRODOTTO-2"] 
-  }
-  Nota: Nell'array selected_products inserisci solo gli ID (es: "PAV-01") dei prodotti che corrispondono alla scelta del cliente.
-
-  Se non hai ancora finito di fare le domande, rispondi normalmente con il testo della domanda.
-  `;
-
-  try {
-    const response = await openai.chat.completions.create({
-      model: "gpt-4o-mini",
-      messages: [
-        { role: "system", content: systemInstruction },
-        ...messages
-      ],
-      temperature: 0.5
-    });
-
-    const reply = response.choices.message.content.trim();
-    
-    if (reply.startsWith('{')) {
-      const parsedData = JSON.parse(reply);
-      // Arricchiamo i dati aggiungendo i dettagli completi dei prodotti scelti per il FE
-      const prodottiDettaglio = CATALOGO_PRODOTTI.filter(p => parsedData.selected_products.includes(p.id));
-      return res.json({ status: "completed", data: parsedData, prodotti: prodottiDettaglio });
-    }
-
-    return res.json({ status: "chatting", message: reply });
-  } catch (error) {
-    console.error(error);
-    res.status(500).json({ error: "Errore nell'elaborazione della chat." });
-  }
+app.get('/api/config', (req, res) => {
+  res.json(BRAND);
 });
 
-app.post('/api/render', async (req, res) => {
-  const { room_type, style, flooring, furniture } = req.body;
+app.post('/api/chat', chatLimiter, async (req, res) => {
+  const messages = sanitizeMessages(req.body?.messages);
+  const profile = sanitizeProfile(req.body?.profile);
 
-  const prompt = `A professional photorealistic 3D architectural rendering of a ${room_type}, ${style} style, with ${flooring} and featuring ${furniture}. High-end interior design, realistic studio lighting, 8k resolution, highly detailed commercial photography.`;
+  const turn = await nextTurn(messages, profile);
+  if (turn.type !== 'complete') return res.json(turn);
 
-  try {
-    const output = await replicate.run(
-      "stability-ai/sdxl:7762d64e79c90b05756a31819e999026172da33d683a2bd657bc5cf19e925973",
-      {
-        input: {
-          prompt: prompt,
-          negative_prompt: "ugly, deformed, blurry, low quality, bad composition, unrealistic shapes",
-          num_outputs: 1,
-          scheduler: "K_EULER",
-          guidance_scale: 8.0,
-          num_inference_steps: 30
-        }
-      }
-    );
-    res.json({ success: true, imageUrl: output[0] || output });
-  } catch (error) {
-    console.error(error);
-    res.status(500).json({ error: "Errore nella generazione dell'immagine." });
-  }
+  // Intervista conclusa: seconda chiamata che sceglie i prodotti e scrive il prompt del render
+  const transcript = [...messages, { role: 'assistant', content: turn.message }];
+  const final = await finalizeDesign(transcript, turn.profile);
+  const design = await createDesign({ profile: turn.profile, final });
+  res.json({ ...turn, design: toClientDesign(design) });
 });
 
-const PORT = 3000;
-app.listen(PORT, () => console.log(`Server attivo su http://localhost:${PORT}`));
+app.get('/api/designs/:id', async (req, res) => {
+  const design = await loadDesignOr404(req, res);
+  if (design) res.json(toClientDesign(design));
+});
+
+app.post('/api/designs/:id/render', renderLimiter, async (req, res) => {
+  const design = await loadDesignOr404(req, res);
+  if (!design) return;
+  if (design.renders.length >= MAX_RENDERS_PER_DESIGN) {
+    return res.status(429).json({ error: 'Numero massimo di render raggiunto per questo progetto.' });
+  }
+
+  const urls = await generateRenders(design.id, design.final.render_prompt, RENDER_VARIANTS);
+  const createdAt = new Date().toISOString();
+  const version = design.versions.length;
+  design.renders.push(...urls.map(url => ({ url, createdAt, version })));
+  await saveDesign(design);
+
+  res.json(toClientDesign(design));
+});
+
+app.post('/api/designs/:id/refine', refineLimiter, async (req, res) => {
+  const instruction = sanitizeInstruction(req.body?.instruction);
+  const design = await loadDesignOr404(req, res);
+  if (!design) return;
+
+  const { message, final } = await refineDesign(design.final, instruction);
+  design.versions.push({ final: design.final, instruction, replacedAt: new Date().toISOString() });
+  design.final = final;
+  await saveDesign(design);
+
+  res.json({ message, design: toClientDesign(design) });
+});
+
+// Express 5 inoltra qui anche gli errori delle route async
+app.use((err, req, res, next) => {
+  if (err instanceof PublicError) {
+    return res.status(err.status).json({ error: err.message });
+  }
+  if (err.type === 'entity.too.large') {
+    return res.status(413).json({ error: 'Richiesta troppo grande.' });
+  }
+  // Solo lo stack: gli errori degli SDK possono contenere header con le chiavi API
+  const errorStatus = err.status || err.response?.status;
+  const errorMessage = err.message || "Errore sconosciuto";
+  console.error(`Rendering error (${errorStatus || 500}): ${errorMessage}`);
+  res.status(500).json({
+    error: errorStatus === 402
+      ? "L'account Replicate non ha credito disponibile."
+      : "Errore nella generazione dell'immagine.",
+    details: process.env.NODE_ENV === 'production' ? undefined : errorMessage
+  });
+});
+
+// In Express 5 gli errori di avvio (es. porta occupata) arrivano alla callback
+app.listen(PORT, err => {
+  if (err) throw err;
+  console.log(`Server attivo su http://localhost:${PORT}`);
+});
